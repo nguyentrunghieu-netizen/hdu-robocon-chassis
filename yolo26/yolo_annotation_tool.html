@@ -1,0 +1,806 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>YOLO Annotation Tool</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+    background: #1a1a1a;
+    color: #e0e0e0;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    user-select: none;
+  }
+
+  .toolbar {
+    background: #2a2a2a;
+    padding: 12px 16px;
+    border-bottom: 1px solid #3a3a3a;
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .toolbar h1 {
+    font-size: 16px;
+    color: #4ade80;
+    margin-right: 8px;
+  }
+
+  button, .btn {
+    background: #3a3a3a;
+    color: #e0e0e0;
+    border: 1px solid #4a4a4a;
+    padding: 8px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    transition: background 0.15s;
+    font-family: inherit;
+  }
+  button:hover, .btn:hover { background: #4a4a4a; }
+  button.primary { background: #2563eb; border-color: #3b82f6; }
+  button.primary:hover { background: #3b82f6; }
+  button.success { background: #16a34a; border-color: #22c55e; color: white; }
+  button.success:hover { background: #22c55e; }
+  button.danger { background: #dc2626; border-color: #ef4444; color: white; }
+  button.danger:hover { background: #ef4444; }
+
+  input[type="text"], input[type="number"], select {
+    background: #1a1a1a;
+    color: #e0e0e0;
+    border: 1px solid #4a4a4a;
+    padding: 7px 10px;
+    border-radius: 6px;
+    font-size: 13px;
+    font-family: inherit;
+  }
+
+  .toolbar input[type="file"] { display: none; }
+
+  .main {
+    flex: 1;
+    display: flex;
+    overflow: hidden;
+  }
+
+  .sidebar {
+    width: 240px;
+    background: #232323;
+    border-right: 1px solid #3a3a3a;
+    overflow-y: auto;
+    padding: 12px;
+  }
+  .sidebar-right {
+    width: 280px;
+    border-right: none;
+    border-left: 1px solid #3a3a3a;
+  }
+  .sidebar h3 {
+    font-size: 11px;
+    color: #888;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+    letter-spacing: 0.5px;
+    margin-top: 4px;
+  }
+
+  .thumb-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .thumb {
+    background: #2a2a2a;
+    border: 2px solid transparent;
+    border-radius: 6px;
+    padding: 6px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    transition: all 0.15s;
+  }
+  .thumb:hover { background: #333; }
+  .thumb.active { border-color: #4ade80; background: #1a3a2a; }
+  .thumb.labeled .check { display: inline; }
+  .thumb .check { display: none; color: #4ade80; font-weight: bold; margin-left: auto; }
+  .thumb img {
+    width: 40px;
+    height: 40px;
+    object-fit: cover;
+    border-radius: 4px;
+  }
+  .thumb .name {
+    font-size: 12px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+    min-width: 0;
+  }
+
+  .canvas-area {
+    flex: 1;
+    background: #0f0f0f;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: auto;
+    position: relative;
+  }
+  .canvas-wrapper {
+    position: relative;
+    line-height: 0;
+  }
+  #imageCanvas {
+    display: block;
+    cursor: crosshair;
+  }
+
+  .empty-state {
+    text-align: center;
+    color: #666;
+    padding: 40px;
+  }
+  .empty-state h2 { margin-bottom: 12px; color: #888; font-size: 24px; }
+  .empty-state p { margin-bottom: 8px; }
+
+  .class-list, .box-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 16px;
+  }
+  .class-item, .box-item {
+    background: #2a2a2a;
+    padding: 8px 10px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    cursor: pointer;
+    border: 2px solid transparent;
+  }
+  .class-item:hover { background: #333; }
+  .class-item.active { border-color: #4ade80; background: #1a3a2a; }
+  .color-dot {
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    border: 1px solid rgba(255,255,255,0.2);
+  }
+  .class-item .name, .box-item .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .class-item button, .box-item button {
+    padding: 2px 8px;
+    font-size: 11px;
+  }
+
+  .add-class-row {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 12px;
+  }
+  .add-class-row input { flex: 1; min-width: 0; }
+
+  .help {
+    background: #1a2a3a;
+    border-left: 3px solid #3b82f6;
+    padding: 10px;
+    border-radius: 4px;
+    font-size: 12px;
+    line-height: 1.6;
+    color: #b0c4de;
+    margin-bottom: 16px;
+  }
+  .help kbd {
+    background: #3a3a3a;
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-size: 11px;
+    border: 1px solid #555;
+  }
+
+  .stats {
+    background: #2a2a2a;
+    padding: 8px 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    margin-bottom: 12px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .progress-info {
+    font-size: 12px;
+    color: #888;
+    margin-left: auto;
+  }
+</style>
+</head>
+<body>
+
+<div class="toolbar">
+  <h1>🎯 YOLO Annotation Tool</h1>
+  <label class="btn">
+    📁 Upload ảnh
+    <input type="file" id="fileInput" multiple accept="image/*">
+  </label>
+  <button onclick="saveProgress()" title="Lưu tiến độ ra file json">💾 Lưu tiến độ</button>
+  <button onclick="loadProgress()" title="Mở lại tiến độ đã lưu">📂 Mở tiến độ</button>
+  <button class="success" onclick="exportYOLO()">📦 Xuất ra YOLO</button>
+  <span class="progress-info" id="progressInfo"></span>
+</div>
+
+<div class="main">
+  <div class="sidebar">
+    <h3>Ảnh (<span id="imgCount">0</span>)</h3>
+    <div class="thumb-list" id="thumbList"></div>
+  </div>
+
+  <div class="canvas-area" id="canvasArea">
+    <div class="empty-state" id="emptyState">
+      <h2>👋 Bắt đầu nào!</h2>
+      <p>1. Bấm <strong>"Upload ảnh"</strong> ở trên để load ảnh</p>
+      <p>2. Tạo các <strong>class</strong> ở thanh bên phải</p>
+      <p>3. Click + kéo chuột trên ảnh để vẽ box</p>
+      <p>4. Bấm <strong>"Xuất ra YOLO"</strong> khi xong</p>
+      <p style="margin-top:16px; font-size:12px;">💡 Nhớ bấm "Lưu tiến độ" thường xuyên để tránh mất data nhé!</p>
+    </div>
+    <div class="canvas-wrapper" id="canvasWrapper" style="display:none;">
+      <canvas id="imageCanvas"></canvas>
+    </div>
+  </div>
+
+  <div class="sidebar sidebar-right">
+    <div class="help">
+      <strong>📖 Hướng dẫn:</strong><br>
+      • Click + kéo chuột để vẽ box<br>
+      • Chọn class trước khi vẽ<br>
+      • <kbd>←</kbd> <kbd>→</kbd> chuyển ảnh<br>
+      • <kbd>0</kbd>-<kbd>9</kbd> chọn nhanh class<br>
+      • <kbd>Delete</kbd> xóa box cuối
+    </div>
+
+    <h3>Classes</h3>
+    <div class="add-class-row">
+      <input type="text" id="newClassName" placeholder="Tên class mới..." onkeydown="if(event.key==='Enter')addClass()" />
+      <button class="primary" onclick="addClass()">+ Thêm</button>
+    </div>
+    <div class="class-list" id="classList"></div>
+
+    <h3>Boxes của ảnh hiện tại (<span id="boxCount">0</span>)</h3>
+    <div class="box-list" id="boxList"></div>
+
+    <h3>Train / Val Split</h3>
+    <div class="stats">
+      <span>Tỉ lệ train:</span>
+      <span><input type="number" id="splitRatio" value="80" min="50" max="95" style="width:55px"> %</span>
+    </div>
+  </div>
+</div>
+
+<script>
+// ============ State ============
+let images = [];           // {name, dataUrl, width, height, boxes:[{cls, x, y, w, h}]}
+let currentImageIdx = -1;
+let currentImageEl = null; // cached HTMLImageElement
+let classes = [];          // {name, color}
+let currentClassIdx = 0;
+
+const COLORS = ['#ef4444', '#f59e0b', '#eab308', '#22c55e', '#06b6d4', '#3b82f6', '#8b5cf6', '#ec4899', '#f97316', '#10b981'];
+
+let isDrawing = false;
+let drawStart = null;
+let currentMouse = null;
+
+// ============ Image Upload ============
+document.getElementById('fileInput').addEventListener('change', async (e) => {
+  const files = Array.from(e.target.files);
+  for (const file of files) {
+    if (file.type.startsWith('image/')) {
+      await loadImage(file);
+    }
+  }
+  renderThumbs();
+  if (currentImageIdx === -1 && images.length > 0) {
+    selectImage(0);
+  }
+  updateProgress();
+  e.target.value = '';
+});
+
+function loadImage(file) {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        images.push({
+          name: file.name,
+          dataUrl: e.target.result,
+          width: img.naturalWidth,
+          height: img.naturalHeight,
+          boxes: []
+        });
+        resolve();
+      };
+      img.onerror = resolve;
+      img.src = e.target.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+// ============ Classes ============
+function addClass() {
+  const input = document.getElementById('newClassName');
+  const name = input.value.trim();
+  if (!name) { alert('Hãy nhập tên class'); return; }
+  if (classes.find(c => c.name === name)) { alert('Class này đã tồn tại'); return; }
+  classes.push({ name, color: COLORS[classes.length % COLORS.length] });
+  input.value = '';
+  if (classes.length === 1) currentClassIdx = 0;
+  renderClasses();
+  input.focus();
+}
+
+function removeClass(idx) {
+  if (!confirm(`Xóa class "${classes[idx].name}"? Tất cả box thuộc class này sẽ bị xóa.`)) return;
+  images.forEach(img => {
+    img.boxes = img.boxes.filter(b => b.cls !== idx).map(b => ({
+      ...b,
+      cls: b.cls > idx ? b.cls - 1 : b.cls
+    }));
+  });
+  classes.splice(idx, 1);
+  if (currentClassIdx >= classes.length) currentClassIdx = Math.max(0, classes.length - 1);
+  renderClasses();
+  redrawCanvas();
+  renderBoxList();
+  renderThumbs();
+}
+
+function selectClass(idx) {
+  currentClassIdx = idx;
+  renderClasses();
+}
+
+function renderClasses() {
+  const container = document.getElementById('classList');
+  container.innerHTML = '';
+  classes.forEach((c, idx) => {
+    const div = document.createElement('div');
+    div.className = 'class-item' + (idx === currentClassIdx ? ' active' : '');
+    div.onclick = () => selectClass(idx);
+    div.innerHTML = `
+      <div class="color-dot" style="background:${c.color}"></div>
+      <span class="name">${idx}: ${escapeHtml(c.name)}</span>
+      <button class="danger" onclick="event.stopPropagation(); removeClass(${idx})">×</button>
+    `;
+    container.appendChild(div);
+  });
+}
+
+// ============ Image navigation ============
+function renderThumbs() {
+  const container = document.getElementById('thumbList');
+  container.innerHTML = '';
+  images.forEach((img, idx) => {
+    const div = document.createElement('div');
+    div.className = 'thumb' + (idx === currentImageIdx ? ' active' : '') + (img.boxes.length > 0 ? ' labeled' : '');
+    div.onclick = () => selectImage(idx);
+    div.innerHTML = `
+      <img src="${img.dataUrl}" loading="lazy">
+      <span class="name">${escapeHtml(img.name)}</span>
+      <span class="check">✓</span>
+    `;
+    container.appendChild(div);
+  });
+  document.getElementById('imgCount').textContent = images.length;
+}
+
+function selectImage(idx) {
+  currentImageIdx = idx;
+  renderThumbs();
+  drawCurrentImage();
+  renderBoxList();
+}
+
+// ============ Canvas drawing ============
+const canvas = document.getElementById('imageCanvas');
+const ctx = canvas.getContext('2d');
+
+function drawCurrentImage() {
+  if (currentImageIdx < 0 || !images[currentImageIdx]) {
+    document.getElementById('emptyState').style.display = 'block';
+    document.getElementById('canvasWrapper').style.display = 'none';
+    return;
+  }
+  document.getElementById('emptyState').style.display = 'none';
+  document.getElementById('canvasWrapper').style.display = 'block';
+
+  const imgData = images[currentImageIdx];
+  const img = new Image();
+  img.onload = () => {
+    currentImageEl = img;
+    const area = document.getElementById('canvasArea');
+    const maxW = area.clientWidth - 40;
+    const maxH = area.clientHeight - 40;
+
+    let cw = imgData.width;
+    let ch = imgData.height;
+    const scale = Math.min(maxW / cw, maxH / ch, 1);
+    cw = Math.round(cw * scale);
+    ch = Math.round(ch * scale);
+
+    canvas.width = cw;
+    canvas.height = ch;
+
+    redrawCanvas();
+  };
+  img.src = imgData.dataUrl;
+}
+
+function redrawCanvas() {
+  if (!currentImageEl || currentImageIdx < 0) return;
+  const imgData = images[currentImageIdx];
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(currentImageEl, 0, 0, canvas.width, canvas.height);
+
+  // Draw existing boxes
+  imgData.boxes.forEach((box, idx) => {
+    const cls = classes[box.cls];
+    const color = cls ? cls.color : '#ffffff';
+    const x = box.x * canvas.width;
+    const y = box.y * canvas.height;
+    const w = box.w * canvas.width;
+    const h = box.h * canvas.height;
+
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x, y, w, h);
+
+    const label = `${box.cls}: ${cls ? cls.name : '?'}`;
+    ctx.font = 'bold 12px Arial';
+    const textW = ctx.measureText(label).width;
+    ctx.fillStyle = color;
+    ctx.fillRect(x, y - 18, textW + 8, 18);
+    ctx.fillStyle = '#000';
+    ctx.fillText(label, x + 4, y - 5);
+  });
+
+  // Preview rect while drawing
+  if (isDrawing && drawStart && currentMouse) {
+    const cls = classes[currentClassIdx];
+    ctx.strokeStyle = cls ? cls.color : '#fff';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([5, 5]);
+    const px = drawStart.x * canvas.width;
+    const py = drawStart.y * canvas.height;
+    ctx.strokeRect(px, py, (currentMouse.x - drawStart.x) * canvas.width, (currentMouse.y - drawStart.y) * canvas.height);
+    ctx.setLineDash([]);
+  }
+}
+
+function getMousePos(e) {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    x: Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)),
+    y: Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height))
+  };
+}
+
+canvas.addEventListener('mousedown', (e) => {
+  if (currentImageIdx < 0) return;
+  if (classes.length === 0) {
+    alert('Hãy tạo ít nhất 1 class trước khi vẽ box (ở thanh bên phải)');
+    return;
+  }
+  drawStart = getMousePos(e);
+  currentMouse = { ...drawStart };
+  isDrawing = true;
+});
+
+canvas.addEventListener('mousemove', (e) => {
+  if (!isDrawing) return;
+  currentMouse = getMousePos(e);
+  redrawCanvas();
+});
+
+canvas.addEventListener('mouseup', (e) => {
+  if (!isDrawing) return;
+  isDrawing = false;
+  const end = getMousePos(e);
+
+  let x = Math.min(drawStart.x, end.x);
+  let y = Math.min(drawStart.y, end.y);
+  let w = Math.abs(end.x - drawStart.x);
+  let h = Math.abs(end.y - drawStart.y);
+
+  drawStart = null;
+  currentMouse = null;
+
+  if (w < 0.005 || h < 0.005) {
+    redrawCanvas();
+    return;
+  }
+
+  images[currentImageIdx].boxes.push({
+    cls: currentClassIdx,
+    x, y, w, h
+  });
+
+  redrawCanvas();
+  renderBoxList();
+  renderThumbs();
+  updateProgress();
+});
+
+canvas.addEventListener('mouseleave', () => {
+  if (isDrawing) {
+    isDrawing = false;
+    drawStart = null;
+    currentMouse = null;
+    redrawCanvas();
+  }
+});
+
+// ============ Box list ============
+function renderBoxList() {
+  const container = document.getElementById('boxList');
+  container.innerHTML = '';
+  if (currentImageIdx < 0) {
+    document.getElementById('boxCount').textContent = 0;
+    return;
+  }
+  const boxes = images[currentImageIdx].boxes;
+  document.getElementById('boxCount').textContent = boxes.length;
+  boxes.forEach((box, idx) => {
+    const cls = classes[box.cls];
+    const div = document.createElement('div');
+    div.className = 'box-item';
+    div.innerHTML = `
+      <div class="color-dot" style="background:${cls ? cls.color : '#fff'}"></div>
+      <span class="name">#${idx+1} ${cls ? escapeHtml(cls.name) : 'Unknown'}</span>
+      <button class="danger" onclick="removeBox(${idx})">×</button>
+    `;
+    container.appendChild(div);
+  });
+}
+
+function removeBox(idx) {
+  images[currentImageIdx].boxes.splice(idx, 1);
+  redrawCanvas();
+  renderBoxList();
+  renderThumbs();
+  updateProgress();
+}
+
+// ============ Keyboard ============
+document.addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+  if (e.key === 'ArrowLeft' && currentImageIdx > 0) {
+    selectImage(currentImageIdx - 1);
+    e.preventDefault();
+  } else if (e.key === 'ArrowRight' && currentImageIdx < images.length - 1) {
+    selectImage(currentImageIdx + 1);
+    e.preventDefault();
+  } else if (e.key >= '0' && e.key <= '9') {
+    const idx = parseInt(e.key);
+    if (idx < classes.length) selectClass(idx);
+  } else if (e.key === 'Delete' || e.key === 'Backspace') {
+    if (currentImageIdx >= 0 && images[currentImageIdx].boxes.length > 0) {
+      removeBox(images[currentImageIdx].boxes.length - 1);
+      e.preventDefault();
+    }
+  }
+});
+
+// ============ Save/Load progress ============
+function saveProgress() {
+  if (images.length === 0 && classes.length === 0) {
+    alert('Chưa có gì để lưu');
+    return;
+  }
+  const data = {
+    version: 1,
+    classes,
+    images: images.map(i => ({
+      name: i.name,
+      dataUrl: i.dataUrl,
+      width: i.width,
+      height: i.height,
+      boxes: i.boxes
+    }))
+  };
+  const json = JSON.stringify(data);
+  const blob = new Blob([json], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `yolo_progress_${Date.now()}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function loadProgress() {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = 'application/json';
+  input.onchange = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const data = JSON.parse(ev.target.result);
+        classes = data.classes || [];
+        images = data.images || [];
+        currentImageIdx = images.length > 0 ? 0 : -1;
+        currentClassIdx = 0;
+        renderClasses();
+        renderThumbs();
+        if (currentImageIdx >= 0) selectImage(0);
+        else { drawCurrentImage(); renderBoxList(); }
+        updateProgress();
+        alert(`Đã load: ${images.length} ảnh, ${classes.length} class`);
+      } catch (err) {
+        alert('File không hợp lệ: ' + err.message);
+      }
+    };
+    reader.readAsText(file);
+  };
+  input.click();
+}
+
+// ============ Export YOLO format ============
+async function exportYOLO() {
+  if (images.length === 0) { alert('Chưa có ảnh nào'); return; }
+  if (classes.length === 0) { alert('Chưa có class nào'); return; }
+  const labeledImages = images.filter(i => i.boxes.length > 0);
+  if (labeledImages.length === 0) {
+    if (!confirm('Không có ảnh nào được gắn nhãn. Vẫn tiếp tục xuất?')) return;
+  }
+
+  const splitRatio = parseInt(document.getElementById('splitRatio').value) / 100;
+  const zip = new JSZip();
+
+  // Shuffle and split
+  const shuffled = [...images]
+    .map(v => ({ v, r: Math.random() }))
+    .sort((a, b) => a.r - b.r)
+    .map(x => x.v);
+  const trainCount = Math.max(1, Math.floor(shuffled.length * splitRatio));
+  const train = shuffled.slice(0, trainCount);
+  const val = shuffled.slice(trainCount);
+
+  // Track filenames to avoid collisions
+  const usedNames = new Set();
+  const getSafeName = (origName) => {
+    const base = origName.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9_-]/g, '_');
+    let name = base;
+    let i = 1;
+    while (usedNames.has(name)) {
+      name = `${base}_${i++}`;
+    }
+    usedNames.add(name);
+    return name;
+  };
+
+  const addImage = async (img, split) => {
+    const ext = (img.name.split('.').pop() || 'jpg').toLowerCase();
+    const safeName = getSafeName(img.name);
+    const blob = await (await fetch(img.dataUrl)).blob();
+    zip.file(`images/${split}/${safeName}.${ext}`, blob);
+
+    // YOLO label: class_id x_center y_center width height (all normalized)
+    const labelLines = img.boxes.map(b => {
+      const cx = (b.x + b.w / 2).toFixed(6);
+      const cy = (b.y + b.h / 2).toFixed(6);
+      const w = b.w.toFixed(6);
+      const h = b.h.toFixed(6);
+      return `${b.cls} ${cx} ${cy} ${w} ${h}`;
+    }).join('\n');
+    zip.file(`labels/${split}/${safeName}.txt`, labelLines);
+  };
+
+  for (const img of train) await addImage(img, 'train');
+  for (const img of val) await addImage(img, 'val');
+
+  // data.yaml
+  const yaml = `# YOLO dataset config
+# Sửa "path" thành đường dẫn tuyệt đối tới thư mục dataset (vd: /home/user/my_dataset)
+path: .
+train: images/train
+val: images/val
+
+# So luong class
+nc: ${classes.length}
+
+# Ten cac class (theo thu tu id 0, 1, 2...)
+names: [${classes.map(c => `'${c.name.replace(/'/g, "\\'")}'`).join(', ')}]
+`;
+  zip.file('data.yaml', yaml);
+
+  // README
+  const readme = `# YOLO Dataset
+
+Cau truc:
+- images/train/  - anh de train (${train.length} anh)
+- images/val/    - anh de validate (${val.length} anh)
+- labels/train/  - file label tuong ung (.txt)
+- labels/val/    - file label tuong ung (.txt)
+- data.yaml      - file config cho training
+
+## Cach dung:
+
+1. Giai nen file zip nay
+2. Mo data.yaml va sua dong "path:" thanh duong dan tuyet doi
+3. Cai dat ultralytics:
+   pip install ultralytics
+
+4. Train voi code Python:
+
+   from ultralytics import YOLO
+   model = YOLO("yolo26n.pt")
+   model.train(data="data.yaml", epochs=100, imgsz=640)
+
+## Classes:
+${classes.map((c, i) => `${i}: ${c.name}`).join('\n')}
+
+## Format label YOLO (moi dong = 1 box):
+class_id x_center y_center width height
+
+Tat ca toa do duoc chuan hoa ve [0, 1] (chia cho kich thuoc anh).
+`;
+  zip.file('README.txt', readme);
+
+  // Generate and download
+  const blob = await zip.generateAsync({ type: 'blob' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `yolo_dataset_${Date.now()}.zip`;
+  a.click();
+  URL.revokeObjectURL(url);
+
+  alert(`✅ Đã xuất xong!\n• Train: ${train.length} ảnh\n• Val: ${val.length} ảnh\n• Classes: ${classes.length}`);
+}
+
+// ============ Helpers ============
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+function updateProgress() {
+  const labeled = images.filter(i => i.boxes.length > 0).length;
+  const totalBoxes = images.reduce((s, i) => s + i.boxes.length, 0);
+  document.getElementById('progressInfo').textContent =
+    images.length > 0 ? `${labeled}/${images.length} ảnh đã gắn nhãn • ${totalBoxes} boxes` : '';
+}
+
+window.addEventListener('resize', () => {
+  if (currentImageIdx >= 0) drawCurrentImage();
+});
+
+// Init
+renderClasses();
+renderThumbs();
+updateProgress();
+</script>
+
+</body>
+</html>
