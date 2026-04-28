@@ -14,15 +14,19 @@ Su dung:
   python3 ball_chaser_web_test.py
   python3 ball_chaser_web_test.py --host 0.0.0.0 --port 8080
   python3 ball_chaser_web_test.py --send-serial --serial-port /dev/ttyACM0
+  python3 ball_chaser_web_test.py --serial-port /dev/ttyACM0 --lidar-port /dev/ttyUSB0
 """
 
 import argparse
+import asyncio
 import json
 import math
+import glob
 import re
 import sys
 import threading
 import time
+import traceback
 from collections import deque
 from http import server
 from socketserver import ThreadingMixIn
@@ -31,6 +35,13 @@ import cv2
 import numpy as np
 import serial
 from ultralytics import YOLO
+
+try:
+    import kissicp
+    LIDAR_IMPORT_ERROR = None
+except Exception as exc:  # pragma: no cover - optional runtime dependency
+    kissicp = None
+    LIDAR_IMPORT_ERROR = exc
 
 
 # ======================== CAU HINH ========================
@@ -53,6 +64,7 @@ TARGET_BBOX_H = 120
 MIN_BBOX_H = 30
 DIST_DEADBAND = 0.12
 CENTER_DEADBAND = 0.05
+CENTER_SETTLE_BAND = 0.10
 FORWARD_ALIGN_LIMIT = 0.28
 FORWARD_ALIGN_MIN_GAIN = 0.18
 
@@ -62,6 +74,7 @@ OMEGA_MAX = 1.5
 
 VY_ALIGN_MAX = 0.22
 OMEGA_ALIGN_MAX = 0.28
+OMEGA_ALIGN_MIN = 0.05
 VY_KP = 0.95
 VY_KI = 0.04
 VY_KD = 0.10
@@ -79,6 +92,7 @@ OMEGA_SLEW_RAD_S2 = 4.00
 OMEGA_KP = 2.0
 OMEGA_KI = 0.1
 OMEGA_KD = 0.3
+OMEGA_NEAR_CENTER_DAMP_GAIN = 0.22
 
 VX_KP = 0.8
 VX_KI = 0.05
@@ -99,6 +113,11 @@ KALMAN_R = 1.0
 KALMAN_VEL_DECAY = 0.95
 
 HIST_LEN = 150
+ARDUINO_PORT = '/dev/ttyUSB0' if sys.platform.startswith('linux') else None
+LIDAR_PORT = '/dev/ttyUSB1' if sys.platform.startswith('linux') else 'COM14'
+LIDAR_BAUDRATE = 460800
+LIDAR_BAUDRATES = (460800, 256000, 115200)
+LIDAR_PATH_LEN = 500
 
 
 # ======================== KALMAN ========================
@@ -367,17 +386,41 @@ class SerialManager:
             self.ser.close()
 
 
-def find_serial_port():
+def find_serial_port(preferred_ports=None, exclude_ports=None):
     import glob
 
+    preferred_ports = [port for port in (preferred_ports or []) if port]
+    exclude_ports = set(exclude_ports or [])
+    candidates = []
+
     if sys.platform.startswith('linux'):
-        candidates = glob.glob('/dev/ttyACM*') + glob.glob('/dev/ttyUSB*')
+        for port in preferred_ports:
+            if port not in candidates:
+                candidates.append(port)
+        for port in sorted(glob.glob('/dev/ttyACM*')):
+            if port not in candidates:
+                candidates.append(port)
+        for port in sorted(glob.glob('/dev/ttyUSB*')):
+            if port not in candidates:
+                candidates.append(port)
     elif sys.platform == 'darwin':
-        candidates = glob.glob('/dev/tty.usbmodem*') + glob.glob('/dev/tty.usbserial*')
+        for port in preferred_ports:
+            if port not in candidates:
+                candidates.append(port)
+        for port in sorted(glob.glob('/dev/tty.usbmodem*') + glob.glob('/dev/tty.usbserial*')):
+            if port not in candidates:
+                candidates.append(port)
     else:
-        candidates = [f'COM{i}' for i in range(1, 20)]
+        for port in preferred_ports:
+            if port not in candidates:
+                candidates.append(port)
+        for port in [f'COM{i}' for i in range(1, 20)]:
+            if port not in candidates:
+                candidates.append(port)
 
     for port in candidates:
+        if port in exclude_ports:
+            continue
         try:
             test_ser = serial.Serial(port, 115200, timeout=1)
             test_ser.close()
@@ -385,6 +428,335 @@ def find_serial_port():
         except (serial.SerialException, OSError):
             continue
     return None
+
+
+class LidarPoseManager:
+    def __init__(self, app_state, port=LIDAR_PORT, baudrates=None):
+        self.app_state = app_state
+        self.port = port
+        self.baudrates = tuple(baudrates or LIDAR_BAUDRATES)
+        self.thread = None
+        self.lidar = None
+        self.path = deque(maxlen=LIDAR_PATH_LEN)
+        self.last_console_log = 0.0
+        self.last_status = None
+
+    def _list_visible_serial_ports(self):
+        if sys.platform.startswith('linux'):
+            ports = sorted(glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*'))
+        elif sys.platform == 'darwin':
+            ports = sorted(glob.glob('/dev/tty.usbmodem*') + glob.glob('/dev/tty.usbserial*'))
+        else:
+            ports = [f'COM{i}' for i in range(1, 30)]
+
+        visible = []
+        for port in ports:
+            try:
+                if sys.platform.startswith('linux') or sys.platform == 'darwin':
+                    visible.append(port)
+                else:
+                    test_ser = serial.Serial(port, 115200, timeout=0.05)
+                    test_ser.close()
+                    visible.append(port)
+            except (serial.SerialException, OSError):
+                continue
+        return visible
+
+    def _candidate_ports(self):
+        visible = self._list_visible_serial_ports()
+        if not visible:
+            return [self.port]
+
+        ordered = []
+        for port in (self.port, *visible):
+            if port and port not in ordered:
+                ordered.append(port)
+        return ordered
+
+    def start(self):
+        if kissicp is None:
+            print(f'[LiDAR] DISABLED: cannot import kissicp: {LIDAR_IMPORT_ERROR}')
+        else:
+            print(f'[LiDAR] STARTING: port={self.port} baudrates={self.baudrates}')
+            print(f'[LiDAR] kissicp module: {getattr(kissicp, "__file__", "unknown")}')
+        self.thread = threading.Thread(target=self._thread_main, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        if self.lidar is not None:
+            try:
+                self.lidar.stop_event.set()
+            except Exception:
+                pass
+
+    def _thread_main(self):
+        try:
+            asyncio.run(self._run_async())
+        except Exception as exc:
+            error_text = f'{type(exc).__name__}: {exc!r}'
+            self._update_status('ERROR', lidar_error_text=error_text)
+            print(f'[LiDAR] ERROR: {error_text}')
+            traceback.print_exc(limit=6)
+
+    def _print_serial_devices(self):
+        visible = self._list_visible_serial_ports()
+        print(f'[LiDAR] Visible serial ports: {visible if visible else "none"}')
+        if self.port not in visible and (sys.platform.startswith('linux') or sys.platform == 'darwin'):
+            print(f'[LiDAR] WARNING: configured port {self.port} is not in visible serial ports')
+
+    def _prepare_lidar_port(self, port, baudrate):
+        try:
+            with serial.Serial(port, baudrate, timeout=0.2) as test_ser:
+                try:
+                    test_ser.dtr = False
+                except (OSError, serial.SerialException):
+                    pass
+                test_ser.reset_input_buffer()
+                test_ser.reset_output_buffer()
+                test_ser.write(b'\xA5\x25')  # RPLidar STOP
+                test_ser.flush()
+                time.sleep(0.08)
+                test_ser.reset_input_buffer()
+                print(f'[LiDAR] Prepared serial buffer on {port} @ {baudrate}')
+        except Exception as exc:
+            print(f'[LiDAR] Preflight failed on {port} @ {baudrate}: {type(exc).__name__}: {exc!r}')
+
+    def _update_status(self, status, **extra):
+        now = time.monotonic()
+        with self.app_state.lock:
+            self.app_state.stats.update({
+                'lidar_enabled': kissicp is not None,
+                'lidar_status': status,
+                'lidar_last_update': now,
+            })
+            self.app_state.stats.update(extra)
+        note = extra.get('lidar_error_text', '')
+        if status != self.last_status or now - self.last_console_log >= 1.0:
+            self.last_status = status
+            self.last_console_log = now
+            if note:
+                print(f'[LiDAR] {status}: {note}')
+            else:
+                print(f'[LiDAR] {status}')
+
+    def _update_pose(self, pose, step, error, matches, overlap, scan_count, accepted,
+                     rejected, hard_resets, point_count, map_points):
+        now = time.monotonic()
+        self.path.append((float(pose[0]), float(pose[1])))
+        with self.app_state.lock:
+            self.app_state.stats.update({
+                'lidar_enabled': True,
+                'lidar_status': 'TRACKING',
+                'lidar_x': float(pose[0]),
+                'lidar_y': float(pose[1]),
+                'lidar_theta_deg': float(math.degrees(pose[2])),
+                'lidar_step_dx': float(step[0]),
+                'lidar_step_dy': float(step[1]),
+                'lidar_step_dtheta_deg': float(math.degrees(step[2])),
+                'lidar_error': float(error),
+                'lidar_matches': int(matches),
+                'lidar_overlap': float(overlap),
+                'lidar_scans': int(scan_count),
+                'lidar_accepted': int(accepted),
+                'lidar_rejected': int(rejected),
+                'lidar_hard_resets': int(hard_resets),
+                'lidar_points': int(point_count),
+                'lidar_map_points': int(map_points),
+                'lidar_path': [[x, y] for x, y in self.path],
+                'lidar_last_update': now,
+                'lidar_error_text': '',
+            })
+        if now - self.last_console_log >= 1.0:
+            self.last_console_log = now
+            print(
+                '[LiDAR] TRACKING '
+                f'scan={scan_count} accepted={accepted} rejected={rejected} '
+                f'x={pose[0]:+.3f}m y={pose[1]:+.3f}m '
+                f'theta={math.degrees(pose[2]):+.1f}deg '
+                f'err={error:.3f} overlap={overlap:.2f} pts={point_count}'
+            )
+
+    async def _run_async(self):
+        if kissicp is None:
+            self._update_status('DISABLED', lidar_error_text=str(LIDAR_IMPORT_ERROR))
+            return
+
+        self._update_status('CONNECTING', lidar_error_text='')
+        self._print_serial_devices()
+        candidate_ports = self._candidate_ports()
+        print(f'[LiDAR] Candidate ports: {candidate_ports}')
+        init_errors = []
+        active_port = self.port
+        for port in candidate_ports:
+            for baudrate in self.baudrates:
+                print(f'[LiDAR] Opening serial device {port} @ {baudrate}')
+                self._prepare_lidar_port(port, baudrate)
+                try:
+                    self.lidar = kissicp.RPLidar(port, baudrate)
+                    active_port = port
+                    with self.app_state.lock:
+                        self.app_state.stats['lidar_baudrate'] = baudrate
+                        self.app_state.stats['lidar_port'] = port
+                    print(f'[LiDAR] RPLidar initialized on {port} at {baudrate} baud')
+                    break
+                except Exception as exc:
+                    init_errors.append(f'{port}@{baudrate}: {type(exc).__name__}: {exc!r}')
+                    print(f'[LiDAR] Init failed on {port} @ {baudrate}: {type(exc).__name__}: {exc!r}')
+                    self.lidar = None
+            if self.lidar is not None:
+                break
+
+        if self.lidar is None:
+            raise RuntimeError(
+                f'Cannot initialize RPLidar on candidate ports {candidate_ports}. Tried: ' + '; '.join(init_errors)
+            )
+        self.port = active_port
+        self._update_status('CONNECTED', lidar_error_text='')
+        print('[LiDAR] Connected. Waiting for full 360-degree scans...')
+
+        try:
+            await asyncio.gather(
+                self.lidar.simple_scan(make_return_dict=False),
+                self._process_scans(self.lidar),
+            )
+        finally:
+            try:
+                self.lidar.stop_event.set()
+                time.sleep(0.2)
+                self.lidar.reset()
+            except Exception:
+                pass
+            self._update_status('STOPPED')
+
+    async def _process_scans(self, lidar):
+        local_map = kissicp.LocalMap(
+            kissicp.LOCAL_MAP_NUM_SCANS,
+            kissicp.LOCAL_MAP_VOXEL_M,
+            kissicp.LOCAL_MAP_RANGE_M,
+        )
+        pose = (0.0, 0.0, 0.0)
+        velocity_per_scan = (0.0, 0.0, 0.0)
+        current_scan = []
+        prev_angle = None
+        consecutive_failures = 0
+        scan_count = 0
+        accepted = 0
+        rejected = 0
+        hard_resets = 0
+
+        self.path.clear()
+        self.path.append((0.0, 0.0))
+
+        while self.app_state.running and not lidar.stop_event.is_set():
+            try:
+                point = await asyncio.wait_for(lidar.output_queue.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+
+            angle = float(point['a_deg'])
+            wrapped = prev_angle is not None and prev_angle > 300.0 and angle < 60.0
+            prev_angle = angle
+
+            if not (wrapped and len(current_scan) > 60):
+                current_scan.append(point)
+                continue
+
+            scan_count += 1
+            scan_buf = current_scan
+            current_scan = [point]
+            points = kissicp.scan_to_points(scan_buf, velocity_per_scan)
+
+            if points.shape[0] < kissicp.ICP_MIN_MATCHES:
+                self._update_status(
+                    'LOW_POINTS',
+                    lidar_scans=scan_count,
+                    lidar_points=int(points.shape[0]),
+                    lidar_error_text='too few valid points',
+                )
+                if time.monotonic() - self.last_console_log >= 1.0:
+                    self.last_console_log = time.monotonic()
+                    print(f'[LiDAR] LOW_POINTS scan={scan_count} valid_points={points.shape[0]}')
+                continue
+
+            if len(local_map.scans_world) == 0:
+                local_map.add_scan(points, pose)
+                print(f'[LiDAR] Local map initialized: scan={scan_count} pts={points.shape[0]}')
+                self._update_pose(
+                    pose, (0.0, 0.0, 0.0), 0.0, 0, 1.0,
+                    scan_count, accepted, rejected, hard_resets,
+                    points.shape[0], points.shape[0],
+                )
+                continue
+
+            match_thresh = kissicp.adaptive_threshold(velocity_per_scan)
+            target_map = local_map.query_near(pose)
+            if target_map.shape[0] < kissicp.ICP_MIN_MATCHES:
+                local_map.add_scan(points, pose)
+                continue
+
+            predicted_pose = kissicp.apply_robot_delta(pose, velocity_per_scan)
+            result, fail_reason = kissicp.icp_2d(
+                points,
+                target_map,
+                init_delta=predicted_pose,
+                max_match_dist=match_thresh,
+            )
+
+            if result is None:
+                consecutive_failures += 1
+                rejected += 1
+                if consecutive_failures >= kissicp.MAX_CONSECUTIVE_FAILURES:
+                    local_map.scans_world.clear()
+                    local_map.add_scan(points, pose)
+                    consecutive_failures = 0
+                    hard_resets += 1
+                    velocity_per_scan = (0.0, 0.0, 0.0)
+                    status = 'RESET'
+                else:
+                    status = 'ICP_FAIL'
+                self._update_status(
+                    status,
+                    lidar_scans=scan_count,
+                    lidar_rejected=rejected,
+                    lidar_hard_resets=hard_resets,
+                    lidar_points=int(points.shape[0]),
+                    lidar_error_text=str(fail_reason),
+                )
+                if time.monotonic() - self.last_console_log >= 1.0:
+                    self.last_console_log = time.monotonic()
+                    print(
+                        f'[LiDAR] {status} scan={scan_count} reason={fail_reason} '
+                        f'rejected={rejected} hard_resets={hard_resets}'
+                    )
+                continue
+
+            consecutive_failures = 0
+            new_pose, error, matches, overlap = result
+            step = kissicp.relative_delta(pose, new_pose)
+
+            if not kissicp.velocity_is_plausible(step):
+                rejected += 1
+                self._update_status(
+                    'REJECTED',
+                    lidar_scans=scan_count,
+                    lidar_rejected=rejected,
+                    lidar_points=int(points.shape[0]),
+                    lidar_error_text='implausible velocity',
+                )
+                if time.monotonic() - self.last_console_log >= 1.0:
+                    self.last_console_log = time.monotonic()
+                    print(f'[LiDAR] REJECTED scan={scan_count}: implausible velocity')
+                continue
+
+            pose = new_pose
+            velocity_per_scan = step
+            local_map.add_scan(points, pose)
+            accepted += 1
+            map_points = sum(scan.shape[0] for scan in local_map.scans_world)
+            self._update_pose(
+                pose, step, error, matches, overlap, scan_count, accepted,
+                rejected, hard_resets, points.shape[0], map_points,
+            )
 
 
 # ======================== DASHBOARD ========================
@@ -572,6 +944,11 @@ HTML_PAGE = """<!DOCTYPE html>
       grid-template-columns: minmax(0, 1fr) 320px;
       gap: 16px;
     }
+    .side {
+      display: grid;
+      gap: 16px;
+      align-content: start;
+    }
     .panel {
       background: rgba(23, 28, 35, 0.9);
       border: 1px solid var(--line);
@@ -614,6 +991,24 @@ HTML_PAGE = """<!DOCTYPE html>
     .warn {
       color: #ffd16b;
     }
+    .mapbox {
+      padding: 14px;
+    }
+    .mapbox h2 {
+      margin: 0 0 12px;
+      font-size: 14px;
+      color: var(--accent);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    #lidarMap {
+      width: 100%;
+      aspect-ratio: 1 / 1;
+      display: block;
+      background: #070a0f;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
     @media (max-width: 960px) {
       .grid {
         grid-template-columns: 1fr;
@@ -638,20 +1033,105 @@ HTML_PAGE = """<!DOCTYPE html>
       <div class="panel">
         <img class="stream" src="/stream.mjpg" alt="stream">
       </div>
-      <div class="panel stats">
-        <h2>Live State</h2>
-        <div id="stats"></div>
+      <div class="side">
+        <div class="panel stats">
+          <h2>Live State</h2>
+          <div id="stats"></div>
+        </div>
+        <div class="panel mapbox">
+          <h2>LiDAR Pose</h2>
+          <canvas id="lidarMap" width="320" height="320"></canvas>
+        </div>
       </div>
     </div>
   </div>
   <script>
     const statsEl = document.getElementById('stats');
+        const lidarCanvas = document.getElementById('lidarMap');
+        const lidarCtx = lidarCanvas.getContext('2d');
         const startBtn = document.getElementById('startBtn');
         const stopBtn = document.getElementById('stopBtn');
     document.getElementById('endpoint').textContent = `${location.origin}/stream.mjpg`;
 
     function row(label, value, cls = '') {
       return `<div class="kv"><div class="label">${label}</div><div class="${cls}">${value}</div></div>`;
+    }
+
+    function drawLidarMap(state) {
+      const ctx = lidarCtx;
+      const w = lidarCanvas.width;
+      const h = lidarCanvas.height;
+      const pad = 18;
+      const cx = w / 2;
+      const cy = h / 2;
+      const path = Array.isArray(state.lidar_path) ? state.lidar_path : [];
+      ctx.clearRect(0, 0, w, h);
+      ctx.fillStyle = '#070a0f';
+      ctx.fillRect(0, 0, w, h);
+
+      ctx.strokeStyle = '#1f2a37';
+      ctx.lineWidth = 1;
+      for (let i = 0; i <= 8; i++) {
+        const p = pad + i * (w - 2 * pad) / 8;
+        ctx.beginPath();
+        ctx.moveTo(p, pad);
+        ctx.lineTo(p, h - pad);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(pad, p);
+        ctx.lineTo(w - pad, p);
+        ctx.stroke();
+      }
+
+      let maxAbs = 0.5;
+      for (const p of path) {
+        maxAbs = Math.max(maxAbs, Math.abs(p[0] || 0), Math.abs(p[1] || 0));
+      }
+      maxAbs = Math.max(maxAbs, Math.abs(state.lidar_x || 0), Math.abs(state.lidar_y || 0));
+      const scale = (w / 2 - pad) / maxAbs;
+      const toPx = (x, y) => [cx + x * scale, cy - y * scale];
+
+      ctx.strokeStyle = '#2d4258';
+      ctx.beginPath();
+      ctx.arc(cx, cy, 4, 0, Math.PI * 2);
+      ctx.stroke();
+
+      if (path.length > 1) {
+        ctx.strokeStyle = '#f3c969';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        path.forEach((p, idx) => {
+          const [px, py] = toPx(p[0] || 0, p[1] || 0);
+          if (idx === 0) ctx.moveTo(px, py);
+          else ctx.lineTo(px, py);
+        });
+        ctx.stroke();
+      }
+
+      const x = state.lidar_x || 0;
+      const y = state.lidar_y || 0;
+      const theta = (state.lidar_theta_deg || 0) * Math.PI / 180;
+      const [rx, ry] = toPx(x, y);
+      const headingLen = 28;
+      const hx = rx + Math.cos(theta) * headingLen;
+      const hy = ry - Math.sin(theta) * headingLen;
+
+      ctx.fillStyle = '#83f28f';
+      ctx.beginPath();
+      ctx.arc(rx, ry, 5, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.strokeStyle = '#83f28f';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(rx, ry);
+      ctx.lineTo(hx, hy);
+      ctx.stroke();
+
+      ctx.fillStyle = '#9cb0c1';
+      ctx.font = '12px Consolas, monospace';
+      ctx.fillText(`${maxAbs.toFixed(1)} m`, pad, h - 8);
+      ctx.fillText(state.lidar_status || 'DISABLED', pad, 16);
     }
 
     async function refresh() {
@@ -675,10 +1155,17 @@ HTML_PAGE = """<!DOCTYPE html>
           row('bbox target', state.target_bbox_h.toFixed(1)),
           row('base vx', state.measured_vx.toFixed(3)),
           row('base wz', state.measured_wz.toFixed(3)),
+          row('lidar', state.lidar_status, state.lidar_status === 'TRACKING' ? 'ok' : 'warn'),
+          row('lidar pose', `${state.lidar_x.toFixed(3)}, ${state.lidar_y.toFixed(3)}, ${state.lidar_theta_deg.toFixed(1)} deg`),
+          row('lidar baud', state.lidar_baudrate || '-'),
+          row('lidar scans', `${state.lidar_accepted}/${state.lidar_scans}`),
+          row('lidar err', `${state.lidar_error.toFixed(3)} m`),
+          row('lidar note', state.lidar_error_text || '-'),
           row('vision fps', state.fps_vision.toFixed(1)),
           row('control fps', state.fps_ctrl.toFixed(1)),
           row('last seen', `${state.last_seen_age.toFixed(2)} s`),
         ].join('');
+        drawLidarMap(state);
       } catch (error) {
         statsEl.innerHTML = row('state', 'fetch error', 'warn');
       }
@@ -742,6 +1229,27 @@ class SharedAppState:
             'robot_x': 0.0,
             'robot_y': 0.0,
             'robot_theta_deg': 0.0,
+            'lidar_enabled': False,
+            'lidar_status': 'DISABLED',
+            'lidar_error_text': '',
+            'lidar_baudrate': 0,
+            'lidar_x': 0.0,
+            'lidar_y': 0.0,
+            'lidar_theta_deg': 0.0,
+            'lidar_step_dx': 0.0,
+            'lidar_step_dy': 0.0,
+            'lidar_step_dtheta_deg': 0.0,
+            'lidar_error': 0.0,
+            'lidar_matches': 0,
+            'lidar_overlap': 0.0,
+            'lidar_scans': 0,
+            'lidar_accepted': 0,
+            'lidar_rejected': 0,
+            'lidar_hard_resets': 0,
+            'lidar_points': 0,
+            'lidar_map_points': 0,
+            'lidar_path': [],
+            'lidar_last_update': 0.0,
             'omega_p': 0.0,
             'omega_i': 0.0,
             'omega_d': 0.0,
@@ -893,10 +1401,21 @@ def main():
     parser.add_argument('--send-serial', action='store_true')
     parser.add_argument('--no-serial', action='store_true')
     parser.add_argument('--serial-port', type=str, default=None)
+    parser.add_argument('--no-lidar', action='store_true')
+    parser.add_argument('--lidar-port', type=str, default=LIDAR_PORT)
+    parser.add_argument('--lidar-baudrate', type=int, default=LIDAR_BAUDRATE)
+    parser.add_argument('--lidar-baudrates', type=str, default=None)
     args = parser.parse_args()
 
     app_state = SharedAppState()
     app_state.stats['target_bbox_h'] = float(args.target_h)
+    app_state.stats['lidar_enabled'] = not args.no_lidar
+    if args.lidar_baudrates:
+        lidar_baudrates = tuple(int(value.strip()) for value in args.lidar_baudrates.split(',') if value.strip())
+    else:
+        lidar_baudrates = (args.lidar_baudrate,) + tuple(
+            baudrate for baudrate in LIDAR_BAUDRATES if baudrate != args.lidar_baudrate
+        )
 
     serial_mgr = None
     use_serial = not args.no_serial
@@ -904,7 +1423,10 @@ def main():
         use_serial = True
 
     if use_serial:
-        port = args.serial_port or find_serial_port()
+        preferred_serial_ports = [args.serial_port]
+        if args.serial_port is None and ARDUINO_PORT is not None:
+            preferred_serial_ports.append(ARDUINO_PORT)
+        port = find_serial_port(preferred_ports=preferred_serial_ports, exclude_ports=[args.lidar_port])
         if port:
             serial_mgr = SerialManager(port)
             if not serial_mgr.connect():
@@ -981,10 +1503,21 @@ def main():
     vision_thread = threading.Thread(target=vision_loop, daemon=True)
     vision_thread.start()
 
+    lidar_mgr = None
+    if args.no_lidar:
+        app_state.stats['lidar_status'] = 'DISABLED'
+    else:
+        lidar_mgr = LidarPoseManager(app_state, args.lidar_port, lidar_baudrates)
+        lidar_mgr.start()
+
     print('\n=== CAMERA BASED WEB TEST ===')
     print(f'[Web] Open: http://{args.host if args.host != "0.0.0.0" else "<pi-ip>"}:{args.port}')
     print(f'[Control] {CONTROL_RATE} Hz | target bbox_h={args.target_h}px | target_dist={TARGET_DISTANCE_M:.2f}m')
     print(f'[Model] {args.model} | conf={args.conf} | imgsz={args.imgsz}')
+    if lidar_mgr:
+        print(f'[LiDAR] Pose enabled on {args.lidar_port} @ {lidar_baudrates}')
+    else:
+        print('[LiDAR] Disabled')
     if serial_mgr:
         print('[Serial] Sending commands to Arduino')
     else:
@@ -1063,6 +1596,8 @@ def main():
                     settle_err_x = math.copysign(align_err - CENTER_DEADBAND, err_x)
                     settle_scale = float(np.clip((align_err - CENTER_DEADBAND) /
                                                  max(SMALL_ERR_X_FOR_VY - CENTER_DEADBAND, 1e-6), 0.0, 1.0))
+                    omega_scale = float(np.clip((align_err - CENTER_DEADBAND) /
+                                                max(CENTER_SETTLE_BAND - CENTER_DEADBAND, 1e-6), 0.0, 1.0))
                     if turn_blend >= 0.98:
                         pid_vy.reset()
                         vy_target = 0.0
@@ -1073,9 +1608,12 @@ def main():
                         vy_target = float(np.clip(vy_cmd * (1.0 - turn_blend), -VY_ALIGN_MAX, VY_ALIGN_MAX))
 
                     if turn_blend > 0.0:
-                        err_x_ctrl = err_x
-                        omega_raw = -pid_omega.compute(err_x_ctrl, dt, feedforward=-omega_ff)
-                        omega_target = float(np.clip(omega_raw * turn_blend, -OMEGA_ALIGN_MAX, OMEGA_ALIGN_MAX))
+                        err_x_ctrl = settle_err_x
+                        omega_ff_ctrl = -omega_ff - (OMEGA_NEAR_CENTER_DAMP_GAIN * bearing_rate * (1.0 - omega_scale))
+                        omega_raw = -pid_omega.compute(err_x_ctrl, dt, feedforward=omega_ff_ctrl)
+                        omega_target = float(np.clip(omega_raw * turn_blend * omega_scale, -OMEGA_ALIGN_MAX, OMEGA_ALIGN_MAX))
+                        if omega_scale < 0.999 and abs(omega_target) < OMEGA_ALIGN_MIN:
+                            omega_target = 0.0
                     else:
                         pid_omega.reset()
                         omega_target = 0.0
@@ -1271,6 +1809,8 @@ def main():
         app_state.running = False
         httpd.shutdown()
         httpd.server_close()
+        if lidar_mgr:
+            lidar_mgr.stop()
         if serial_mgr:
             serial_mgr.send_stop()
             serial_mgr.close()
