@@ -1,0 +1,11 @@
+# YOLO dataset config
+# Sửa "path" thành đường dẫn tuyệt đối tới thư mục dataset (vd: /home/user/my_dataset)
+path: .
+train: images/train
+val: images/val
+
+# So luong class
+nc: 1
+
+# Ten cac class (theo thu tu id 0, 1, 2...)
+names: ['pa']
