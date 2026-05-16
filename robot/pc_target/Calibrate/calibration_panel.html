@@ -1,0 +1,304 @@
+<!--
+calibration_panel.html - Panel HTML cho web UI calibration
+
+Cach apply:
+    1. Copy block <style>, <div id="cal-panel">, <script> vao file HTML 
+       cua web UI hien tai (vi tri: trong body, gan cac panel khac).
+    2. Backend Flask phai co cac endpoint:
+         POST /api/calibration/start   -> {mode, manual_distance?, manual_rotation?}
+         GET  /api/calibration/status  -> {status, progress, message, log_tail}
+         POST /api/calibration/abort
+         GET  /api/calibration/config
+       (Tham khao serial_manager_patch.py de biet code Flask).
+-->
+
+<style>
+.cal-panel {
+  background: #1e1e1e;
+  border: 1px solid #444;
+  border-radius: 8px;
+  padding: 16px;
+  margin: 12px 0;
+  color: #ddd;
+  font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+}
+.cal-panel h3 {
+  margin: 0 0 12px 0;
+  color: #4dd0e1;
+  font-size: 18px;
+}
+.cal-panel h4 {
+  margin: 12px 0 6px 0;
+  color: #aaa;
+  font-size: 14px;
+}
+.cal-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+  margin: 8px 0;
+}
+.cal-btn {
+  background: #2a5a8a;
+  color: white;
+  border: none;
+  padding: 8px 14px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.cal-btn:hover { background: #3a7ab0; }
+.cal-btn:disabled {
+  background: #444;
+  color: #888;
+  cursor: not-allowed;
+}
+.cal-btn.danger { background: #a83232; }
+.cal-btn.danger:hover { background: #c84545; }
+.cal-input {
+  background: #2a2a2a;
+  border: 1px solid #555;
+  color: #eee;
+  padding: 6px 10px;
+  border-radius: 4px;
+  width: 100px;
+  font-size: 13px;
+}
+.cal-label {
+  font-size: 13px;
+  color: #aaa;
+}
+.cal-progress-bar {
+  width: 100%;
+  height: 18px;
+  background: #2a2a2a;
+  border-radius: 9px;
+  overflow: hidden;
+  margin: 6px 0;
+}
+.cal-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #4dd0e1, #00bcd4);
+  width: 0%;
+  transition: width 0.3s;
+}
+.cal-status {
+  font-size: 13px;
+  padding: 8px;
+  border-radius: 4px;
+  margin: 6px 0;
+}
+.cal-status.idle    { background: #2a2a2a; color: #888; }
+.cal-status.running { background: #1a3a5a; color: #4dd0e1; }
+.cal-status.done    { background: #1a5a2a; color: #4dffaa; }
+.cal-status.error   { background: #5a1a1a; color: #ff6644; }
+.cal-status.aborted { background: #5a3a1a; color: #ffb84d; }
+.cal-log {
+  background: #0a0a0a;
+  border: 1px solid #333;
+  border-radius: 4px;
+  padding: 8px;
+  font-family: 'Courier New', monospace;
+  font-size: 11px;
+  height: 200px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  color: #aac;
+}
+.cal-config {
+  background: #2a2a2a;
+  padding: 8px;
+  border-radius: 4px;
+  font-family: 'Courier New', monospace;
+  font-size: 12px;
+}
+.cal-warning {
+  background: #5a3a1a;
+  color: #ffb84d;
+  padding: 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  margin: 6px 0;
+}
+</style>
+
+<div id="cal-panel" class="cal-panel">
+  <h3>🛠️ Robot Calibration</h3>
+  
+  <div class="cal-warning">
+    ⚠️ <b>Truoc khi calibrate motor:</b> NHAC robot len, banh xe khong cham dat!
+    <br>⚠️ <b>Truoc khi calibrate wheel/rotation:</b> Dat robot tren san phang, 
+    co > 1.5m khong gian xung quanh.
+  </div>
+
+  <h4>Cau hinh hien tai</h4>
+  <div id="cal-current-config" class="cal-config">Loading...</div>
+
+  <h4>Chon che do</h4>
+  <div class="cal-row">
+    <button class="cal-btn" onclick="calStart('motors')">Motor Kv/Ks</button>
+    <button class="cal-btn" onclick="calStart('wheel')">Wheel Diameter</button>
+    <button class="cal-btn" onclick="calStart('rotation')">Rotation Radius</button>
+    <button class="cal-btn" onclick="calStart('all')">Full Calibration</button>
+  </div>
+
+  <h4>Optional: Manual measurements</h4>
+  <div class="cal-row">
+    <span class="cal-label">Distance (m):</span>
+    <input type="number" id="cal-manual-dist" class="cal-input" 
+           step="0.001" placeholder="vd 1.020">
+    <span class="cal-label">Rotation (deg):</span>
+    <input type="number" id="cal-manual-rot" class="cal-input" 
+           step="0.1" placeholder="vd 360.5">
+  </div>
+
+  <h4>Trang thai</h4>
+  <div id="cal-status" class="cal-status idle">Idle - san sang</div>
+  <div class="cal-progress-bar">
+    <div id="cal-progress-fill" class="cal-progress-fill"></div>
+  </div>
+  <div id="cal-progress-text" class="cal-label">0%</div>
+
+  <div class="cal-row">
+    <button class="cal-btn danger" onclick="calAbort()">⏹ Abort</button>
+    <button class="cal-btn" onclick="calRefreshConfig()">🔄 Refresh Config</button>
+  </div>
+
+  <h4>Log</h4>
+  <div id="cal-log" class="cal-log">(Log se hien o day khi chay calibration)</div>
+</div>
+
+<script>
+let calPollTimer = null;
+
+async function calStart(mode) {
+  const distInput = document.getElementById('cal-manual-dist').value;
+  const rotInput = document.getElementById('cal-manual-rot').value;
+  
+  const body = { mode };
+  if (distInput && parseFloat(distInput) > 0) {
+    body.manual_distance = parseFloat(distInput);
+  }
+  if (rotInput && parseFloat(rotInput) !== 0) {
+    body.manual_rotation = parseFloat(rotInput) * Math.PI / 180; // deg -> rad
+  }
+  
+  let confirmMsg = '';
+  if (mode === 'motors') {
+    confirmMsg = 'NHAC robot len truoc khi tiep tuc!\n\nBanh xe se quay tu do.\nXac nhan?';
+  } else if (mode === 'wheel') {
+    confirmMsg = 'Robot se di thang ~1m.\nDam bao co du khong gian phia truoc.\nXac nhan?';
+  } else if (mode === 'rotation') {
+    confirmMsg = 'Robot se xoay ~360 do.\nDam bao co > 1m khong gian xung quanh.\nXac nhan?';
+  } else if (mode === 'all') {
+    confirmMsg = 'FULL CALIBRATION:\n' +
+                 '1. Motor (NHAC robot len truoc!)\n' +
+                 '2. Wheel diameter (di thang)\n' +
+                 '3. Rotation (xoay tai cho)\n' +
+                 'Tong thoi gian ~3-5 phut.\nXac nhan?';
+  }
+  if (!confirm(confirmMsg)) return;
+  
+  try {
+    const r = await fetch('/api/calibration/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      const err = await r.json();
+      alert('Loi: ' + JSON.stringify(err));
+      return;
+    }
+    setStatus('running', 'Dang chay...');
+    if (calPollTimer) clearInterval(calPollTimer);
+    calPollTimer = setInterval(calPoll, 500);
+  } catch (e) {
+    alert('Network error: ' + e.message);
+  }
+}
+
+async function calAbort() {
+  if (!confirm('Huy calibration? Robot se dung lai.')) return;
+  try {
+    await fetch('/api/calibration/abort', { method: 'POST' });
+  } catch (e) { console.error(e); }
+}
+
+async function calPoll() {
+  try {
+    const r = await fetch('/api/calibration/status');
+    if (!r.ok) return;
+    const data = await r.json();
+    
+    setStatus(data.status, data.message || '');
+    
+    const pct = (data.progress || 0) * 100;
+    document.getElementById('cal-progress-fill').style.width = pct + '%';
+    document.getElementById('cal-progress-text').textContent = pct.toFixed(1) + '%';
+    
+    if (data.log_tail && data.log_tail.length > 0) {
+      const logEl = document.getElementById('cal-log');
+      logEl.textContent = data.log_tail.join('\n');
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    
+    if (data.status === 'done' || data.status === 'error' || data.status === 'aborted') {
+      clearInterval(calPollTimer);
+      calPollTimer = null;
+      calRefreshConfig();
+    }
+  } catch (e) {
+    console.error('cal poll error:', e);
+  }
+}
+
+function setStatus(status, message) {
+  const el = document.getElementById('cal-status');
+  el.className = 'cal-status ' + status;
+  const labels = {
+    idle: 'Idle',
+    running: 'Dang chay',
+    done: '✓ Hoan tat',
+    error: '✗ Loi',
+    aborted: '⏹ Da huy',
+  };
+  el.textContent = (labels[status] || status) + (message ? ' - ' + message : '');
+}
+
+async function calRefreshConfig() {
+  try {
+    const r = await fetch('/api/calibration/config');
+    if (!r.ok) return;
+    const cfg = await r.json();
+    
+    let html = '';
+    html += `wheel_diameter_m  = <b>${(cfg.wheel_diameter_m * 1000).toFixed(2)} mm</b>\n`;
+    html += `rotation_radius_m = <b>${(cfg.rotation_radius_m * 1000).toFixed(2)} mm</b>\n`;
+    html += `last_calibrated   = ${cfg.calibration_time || '(never)'}\n`;
+    
+    if (cfg.motor_params) {
+      html += '\n<b>Motor params:</b>\n';
+      for (const [wheel, dirs] of Object.entries(cfg.motor_params)) {
+        for (const [dir_name, p] of Object.entries(dirs)) {
+          if (p.kv > 0) {
+            html += `  ${wheel} ${dir_name}: Kv=${p.kv.toFixed(4)}, Ks=${p.ks.toFixed(2)}, RMSE=${p.rmse.toFixed(2)}\n`;
+          }
+        }
+      }
+    }
+    
+    document.getElementById('cal-current-config').innerHTML = html;
+  } catch (e) {
+    console.error('cfg refresh error:', e);
+  }
+}
+
+// Load config khi panel xuat hien
+window.addEventListener('load', () => {
+  calRefreshConfig();
+  // Poll status nhe luc startup
+  calPoll();
+});
+</script>

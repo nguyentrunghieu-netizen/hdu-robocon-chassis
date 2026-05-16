@@ -1,0 +1,111 @@
+// ============================================================================
+// ARDUINO PATCH cho calibration mode
+// ============================================================================
+// Them 2 command moi vao mecanum_base.ino:
+//   P <m0> <m1> <m2> <m3>   - Raw PWM, bypass PID (de calibrate Kv/Ks)
+//   Q                        - Query: gui RPM tuc thoi cua 4 banh
+//
+// Cach apply:
+//   1. Tim ham processCommand() trong mecanum_base.ino (~ dong 475)
+//   2. Them 2 case 'P' va 'Q' trong if/else chain (truoc dau } cuoi cung)
+//   3. Them bien `bool calibrationMode = false;` o dau file (gan cac bien khac)
+//   4. Trong loop(), khi calibrationMode = true thi BO QUA buoc PID + 
+//      buoc applyMotorPwm cuoi
+//
+// Day la code can them vao processCommand:
+// ============================================================================
+
+else if (cmd[0] == 'P' && cmd[1] == ' ') {
+  // P m0 m1 m2 m3   - Raw PWM, bypass PID
+  // Range: -255 .. +255
+  float p0 = 0, p1 = 0, p2 = 0, p3 = 0;
+  if (parseFourFloats(cmd + 2, p0, p1, p2, p3)) {
+    p0 = constrain(p0, -255.0f, 255.0f);
+    p1 = constrain(p1, -255.0f, 255.0f);
+    p2 = constrain(p2, -255.0f, 255.0f);
+    p3 = constrain(p3, -255.0f, 255.0f);
+    
+    // Bat che do calibration: bypass PID
+    calibrationMode = true;
+    calibrationPwm[0] = p0;
+    calibrationPwm[1] = p1;
+    calibrationPwm[2] = p2;
+    calibrationPwm[3] = p3;
+    
+    // Reset PID integral de tranh "noi" tu PID cu
+    for (int i = 0; i < 4; ++i) wheelIntegralPwm[i] = 0.0f;
+    
+    lastCmdTime = millis();
+    
+    // Neu tat ca = 0, tat che do calibration de quay ve PID binh thuong
+    if (p0 == 0 && p1 == 0 && p2 == 0 && p3 == 0) {
+      calibrationMode = false;
+      hardStopAll();
+    }
+  }
+}
+else if (cmd[0] == 'Q') {
+  // Query raw RPM tuc thoi
+  // Format: "QR r0 r1 r2 r3"
+  Serial.print("QR ");
+  Serial.print(actualRPMFilt[0], 2); Serial.print(' ');
+  Serial.print(actualRPMFilt[1], 2); Serial.print(' ');
+  Serial.print(actualRPMFilt[2], 2); Serial.print(' ');
+  Serial.println(actualRPMFilt[3], 2);
+}
+
+// ============================================================================
+// Helper de parse 4 float (them ben canh parseThreeFloats):
+// ============================================================================
+
+bool parseFourFloats(const char* s, float& a, float& b, float& c, float& d) {
+  char* end;
+  a = strtof(s, &end); if (end == s) return false; s = end;
+  b = strtof(s, &end); if (end == s) return false; s = end;
+  c = strtof(s, &end); if (end == s) return false; s = end;
+  d = strtof(s, &end); if (end == s) return false;
+  return true;
+}
+
+// ============================================================================
+// Bien global moi (them gan cac khai bao bien khac, vd o dau file):
+// ============================================================================
+
+bool calibrationMode = false;
+float calibrationPwm[4] = {0, 0, 0, 0};
+
+// ============================================================================
+// PATCH cho ham loop():
+// ============================================================================
+// Tim doan code "applyMotorPwm(pwmOutput[0], ...)" o cuoi loop().
+// Thay the bang doan duoi day:
+
+if (calibrationMode) {
+  // Bypass PID, output PWM thang
+  applyMotorPwm(calibrationPwm[0], calibrationPwm[1],
+                calibrationPwm[2], calibrationPwm[3]);
+  // Khong update wheelIntegralPwm (giu = 0)
+} else {
+  // PID binh thuong (giu nguyen logic cu)
+  if (nearStopCmd && nearStopMeas) {
+    applyMotorPwm(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int i = 0; i < 4; ++i) wheelIntegralPwm[i] = 0.0f;
+  } else {
+    applyMotorPwm(pwmOutput[0], pwmOutput[1], pwmOutput[2], pwmOutput[3]);
+  }
+}
+
+// ============================================================================
+// LUU Y KHI CALIBRATE Kv/Ks:
+// ============================================================================
+// 1. Robot phai duoc NHAC LEN, banh xe khong cham dat.
+//    Neu khong, ma sat san se lam ket qua sai.
+//
+// 2. Neu PWM duoi khoang 50-60, banh co the khong quay (Ks chua du de thang
+//    static friction). Day la BINH THUONG. Linear regression chi su dung
+//    cac diem co RPM > 5.
+//
+// 3. Sau khi calibrate, hay update gia tri Kv/Ks vao constants 
+//    WHEEL_KV_PWM_PER_RPM va WHEEL_KS_PWM trong file .ino, hoac luu tren 
+//    Python va gui xuong qua command moi (vd: K kv ks). Khuyen nghi tao 
+//    command K de tranh phai re-flash Arduino moi lan calibrate.
